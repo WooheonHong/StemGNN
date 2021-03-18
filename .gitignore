@@ -3,10 +3,11 @@ __pycache__/
 *$py.class
 StemGNN
 .vscode/
-dataset/
+dataset/*.csv
 *.csv
 results/
 *.json
+temp.py 
 
 # Distribution / packaging
 .Python
