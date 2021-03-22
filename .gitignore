@@ -7,9 +7,8 @@ dataset/*.csv
 *.csv
 results/
 *.json
-temp.py 
+temp.py
 *_ms.py
-(.*)_(.*)_ms.py
 
 # Distribution / packaging
 .Python
