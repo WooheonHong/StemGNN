@@ -8,6 +8,8 @@ dataset/*.csv
 results/
 *.json
 temp.py 
+*_ms.py
+(.*)_(.*)_ms.py
 
 # Distribution / packaging
 .Python

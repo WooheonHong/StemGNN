@@ -55,7 +55,8 @@ def inference(
             # rolling strategy
             forecast_steps = np.zeros([inputs.size()[0], horizon, node_cnt], dtype=np.float)
             while step < horizon:
-                forecast_result, a = model(inputs)
+                forecast_result, backcast_result, a = model(inputs)
+                # forecast_result, a = model(inputs)
                 len_model_output = forecast_result.size()[1]
                 if len_model_output == 0:
                     raise Exception("Get blank inference result")
@@ -72,10 +73,6 @@ def inference(
                     .numpy()
                 )
                 step += min(horizon - step, len_model_output)
-            if forecast_loss is not None:
-                loss = forecast_loss(torch.from_numpy(forecast_steps).to(device), target)
-                manager.track_loss(loss, inputs, is_train=False)
-
             forecast_set.append(forecast_steps)
             target_set.append(target.detach().cpu().numpy())
 
@@ -147,7 +144,18 @@ def validate(
 
 def train(train_data, valid_data, args, result_file):
     node_cnt = train_data.shape[1]
-    model = Model(node_cnt, 2, args.window_size, args.multi_layer, horizon=args.horizon)
+    model = Model(
+        node_cnt,
+        2,
+        args.window_size,
+        args.attention_channel,
+        args.randomwalk_laplacian,
+        args.kernel_size,
+        args.gcnn_channel,
+        args.gconv_channel,
+        args.multi_channel,
+        horizon=args.horizon,
+    )
     model.to(args.device)
     if len(train_data) == 0:
         raise Exception("Cannot organize enough training data")
@@ -200,6 +208,7 @@ def train(train_data, valid_data, args, result_file):
     )
 
     forecast_loss = nn.MSELoss(reduction="mean").to(args.device)
+    backcast_loss = nn.MSELoss(reduction="mean").to(args.device)
 
     total_params = 0
     for name, parameter in model.named_parameters():
@@ -221,8 +230,16 @@ def train(train_data, valid_data, args, result_file):
             inputs = inputs.to(args.device)
             target = target.to(args.device)
             model.zero_grad()
-            forecast, _ = model(inputs)
-            loss = forecast_loss(forecast, target)
+            forecast, backcast, attention = model(inputs)
+            # forecast, attention = model(inputs)
+            # print("forecast shape", forecast.shape)
+            # print("backcast shape", backcast.shape)
+            # print("target shape", target[:, 0:1, :].shape)
+            # print("input shape", inputs.shape)
+            loss = forecast_loss(forecast, target[:, 0:1, :]) + backcast_loss(
+                backcast, inputs
+            )
+            # loss = forecast_loss(forecast, target[:, 0:1, :])
             cnt += 1
             loss.backward()
             my_optim.step()
@@ -325,7 +342,15 @@ def tuning(train_data, valid_data, test_data, args, params):
 
         node_cnt = train_data.shape[1]
         model = Model(
-            node_cnt, 2, args.window_size, args.multi_layer, horizon=args.horizon,
+            node_cnt,
+            2,
+            args.window_size,
+            args.attention_channel,
+            args.randomwalk_laplacian,
+            args.gcnn_channel,
+            args.gconv_channel,
+            args.multi_channel,
+            horizon=args.horizon,
         )
         model.to(args.device)
 

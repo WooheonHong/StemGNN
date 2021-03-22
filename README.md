@@ -39,6 +39,7 @@ New parameter are bold type.
 | epoch | epoch size during training |
 | lr | learning rate |
 | **attention_layer** | hyper parameter of STemGNN which controls the parameter number of attention layers, default 32|
+| **randomwalk_laplacian** | determine whether to use randomwalk normalized laplacian matrix|
 | multi_layer | hyper parameter of STemGNN which controls the parameter number of hidden layers, default 5 |
 | device | device that the code works on, 'cpu' or 'cuda:x' | 
 | validate_freq | frequency of validation |

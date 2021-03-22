@@ -1,109 +1,159 @@
+import math
+
+from utils.graph_utils import calculate_scaled_laplacian
+from utils.graph_utils import calculate_normalized_laplacian
+from utils.graph_utils import calculate_randomwalk_normalized_laplacian
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+
 
 # 1d conv + Gated Linear Unit = gated CNN
-class GLU(nn.Module):
-    def __init__(self, input_channel, output_channel):
-        super(GLU, self).__init__()
-        self.linear_left = nn.Linear(input_channel, output_channel)
-        self.linear_right = nn.Linear(input_channel, output_channel)
+class GCNN(nn.Module):
+    def __init__(self, input_channel, output_channel, kernel_size=3):
+        super(GCNN, self).__init__()
+        self.filter_conv = nn.Conv2d(
+            input_channel, output_channel, kernel_size=(1, kernel_size),
+        )
+        self.gate_conv = nn.Conv1d(
+            input_channel, output_channel, kernel_size=(1, kernel_size),
+        )
 
     def forward(self, x):
-        return torch.mul(self.linear_left(x), torch.sigmoid(self.linear_right(x)))
+        return torch.mul(self.filter_conv(x), torch.sigmoid(self.gate_conv(x)))
 
 
-class StockBlockLayer(nn.Module):
-    def __init__(self, time_step, unit, multi_layer, stack_cnt=0):
-        super(StockBlockLayer, self).__init__()
+class StemGNN_Block(nn.Module):
+    def __init__(
+        self,
+        time_step,
+        unit,
+        kernel_size,
+        gcnn_channel,
+        gconv_channel,
+        multi_channel,
+        dropout_rate,
+        stack_cnt=0,
+    ):
+        super(StemGNN_Block, self).__init__()
         self.time_step = time_step
         self.unit = unit
         self.stack_cnt = stack_cnt
-        self.multi = multi_layer
-        self.weight = nn.Parameter(
-            torch.Tensor(
-                1, 3 + 1, 1, self.time_step * self.multi, self.multi * self.time_step
-            )
-        )  # [K+1, 1, in_c, out_c]
-        nn.init.xavier_normal_(self.weight)
-        self.forecast = nn.Linear(self.time_step * self.multi, self.time_step * self.multi)
-        self.forecast_result = nn.Linear(self.time_step * self.multi, self.time_step)
-        if self.stack_cnt == 0:
-            self.backcast = nn.Linear(self.time_step * self.multi, self.time_step)
-        self.backcast_short_cut = nn.Linear(self.time_step, self.time_step)
-        self.relu = nn.ReLU()
-        self.GLUs = nn.ModuleList()
-        self.output_channel = 4 * self.multi
-        for i in range(3):
-            if i == 0:
-                self.GLUs.append(
-                    GLU(self.time_step * 4, self.time_step * self.output_channel)
-                )
-                self.GLUs.append(
-                    GLU(self.time_step * 4, self.time_step * self.output_channel)
-                )
-            elif i == 1:
-                self.GLUs.append(
-                    GLU(
-                        self.time_step * self.output_channel,
-                        self.time_step * self.output_channel,
-                    )
-                )
-                self.GLUs.append(
-                    GLU(
-                        self.time_step * self.output_channel,
-                        self.time_step * self.output_channel,
-                    )
-                )
-            else:
-                self.GLUs.append(
-                    GLU(
-                        self.time_step * self.output_channel,
-                        self.time_step * self.output_channel,
-                    )
-                )
-                self.GLUs.append(
-                    GLU(
-                        self.time_step * self.output_channel,
-                        self.time_step * self.output_channel,
-                    )
-                )
 
-    def spe_seq_cell(self, input):
-        batch_size, k, input_channel, node_cnt, time_step = input.size()
-        input = input.view(batch_size, -1, node_cnt, time_step)
-        ffted = torch.rfft(input, 1, onesided=False)
-        real = (
-            ffted[..., 0].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+        self.residual_channel = gconv_channel
+        self.kernel_size = kernel_size
+        self.gcnn_channel = gcnn_channel
+        self.gconv_channel = gconv_channel
+        self.multi_channel = multi_channel
+
+        self.batch_norm = nn.BatchNorm2d(self.multi_channel)
+        self.relu = nn.ReLU()
+
+        self.residual_conv = nn.ModuleList()
+        self.gcnn_real = nn.ModuleList()
+        self.gcnn_imag = nn.ModuleList()
+        # block 1
+        self.residual_conv.append(nn.Conv2d(1, self.residual_channel, kernel_size=(1, 1)))
+        self.gcnn_real.append(GCNN(1, self.gcnn_channel, self.kernel_size))
+        self.gcnn_imag.append(GCNN(1, self.gcnn_channel, self.kernel_size))
+
+        # block 2
+        self.residual_conv.append(
+            nn.Conv2d(self.gconv_channel, self.residual_channel, kernel_size=(1, 1))
         )
-        img = (
-            ffted[..., 1].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+        self.gcnn_real.append(GCNN(self.gconv_channel, self.gcnn_channel, self.kernel_size))
+        self.gcnn_imag.append(GCNN(self.gconv_channel, self.gcnn_channel, self.kernel_size))
+
+        self.weight = nn.Parameter(
+            torch.Tensor(self.gcnn_channel, self.gconv_channel)
+        )  # [K+1, 1, in_c, out_c]
+        nn.init.kaiming_normal_(self.weight)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(self.gconv_channel, self.gconv_channel, kernel_size=(1, 1),),
+            # nn.Sigmoid(),
+            # nn.Softmax(dim=1),
         )
-        for i in range(3):
-            real = self.GLUs[i * 2](real)  # batch, node, time_step * output_channel
-            img = self.GLUs[2 * i + 1](img)
-        real = real.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
-        img = img.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
-        time_step_as_inner = torch.cat([real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
-        iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
+        self.forecast = nn.Sequential(
+            nn.Conv2d(self.gconv_channel, self.multi_channel, kernel_size=(1, 1),),
+            nn.ReLU(),
+            nn.BatchNorm2d(self.multi_channel),
+            nn.Dropout(p=dropout_rate),
+        )
+        self.backcast = nn.Sequential(
+            nn.Conv2d(self.gconv_channel, self.multi_channel, kernel_size=(1, 1),),
+            nn.ReLU(),
+            nn.BatchNorm2d(self.multi_channel),
+            nn.Dropout(p=dropout_rate),
+        )
+
+    def spe_seq_cell(self, x):
+        # for real input, negative frequency redundant
+        ffted = torch.fft.rfft(x)  # 12 -> (12/6) + 1
+        # ffted = torch.stft(x, 4)  # 12 -> (12/6) + 1
+        # print("after fft:", ffted.shape)
+        real = self.gcnn_real[self.stack_cnt](ffted.real)  # (12/6) + 1 -> (12/6) + 1 - 2
+        imag = self.gcnn_imag[self.stack_cnt](ffted.imag)
+        time_step_as_inner = torch.stack((real, imag), -1)
+        # print("time_step_as_inner: ", time_step_as_inner.shape)
+        time_step_as_inner = torch.view_as_complex(time_step_as_inner)
+        iffted = torch.fft.irfft(time_step_as_inner)  # (((12/6) + 1 - 2 ) - 1) * 2-> 8
+        # iffted = torch.istft(time_step_as_inner, 4)
+        # print("iffted shape: ", iffted.shape)
+
         return iffted
 
-    def forward(self, x, mul_L):
-        mul_L = mul_L.unsqueeze(1)  # 4, 1, node, node
-        x = x.unsqueeze(1)  # batch, 1, node, window
-        gfted = torch.matmul(mul_L, x)  # batch, 4, 1, node, window
-        gconv_input = self.spe_seq_cell(gfted).unsqueeze(2)  # batch 4, 1, node, window
-        igfted = torch.matmul(gconv_input, self.weight)  # batch 4, 1, node, window *
-        igfted = torch.sum(igfted, dim=1)
-        forecast_source = torch.sigmoid(self.forecast(igfted).squeeze(1))
-        forecast = self.forecast_result(forecast_source)
-        if self.stack_cnt == 0:
-            backcast_short = self.backcast_short_cut(x).squeeze(1)
-            backcast_source = torch.sigmoid(self.backcast(igfted) - backcast_short)
-        else:
-            backcast_source = None
+    def forward(self, input, Lambda_, U):
+        GFT = torch.transpose(U, 0, 1)
+        gconv_operator = torch.diag_embed(Lambda_)  # make diagonal matrix
+        IGFT = U
 
-        return forecast, backcast_source
+        x_residual = self.relu(self.residual_conv[self.stack_cnt](input))
+        # print("x residual shape: ", x_residual.shape)
+        x = torch.einsum("binw, nn -> binw", input, GFT)
+        x = self.spe_seq_cell(x)
+        x = torch.einsum("binw, nn -> binw", x, gconv_operator)  # gconv
+        x = torch.einsum("binw, io -> bonw", x, self.weight)
+        x = torch.einsum("bonw, nn -> bonw", x, IGFT)
+
+        x = self.fc(x)
+
+        x = self.relu(
+            x_residual[:, :, :, (self.kernel_size - 1) * 2 : x_residual.shape[3]] + x
+        )
+
+        if self.stack_cnt == 0:
+            backcast_source = x_residual[
+                :, :, :, (self.kernel_size - 1) * 2 : x_residual.shape[3]
+            ] - self.relu(x)
+
+        else:
+            backcast_source = x
+
+        forecast = self.forecast(x)
+        backcast = self.backcast(backcast_source)
+
+        return forecast, backcast, backcast_source
+
+
+class OutputLayer(nn.Module):
+    def __init__(self, c_in, c_out):
+        super(OutputLayer, self).__init__()
+        self.glu = nn.GLU(dim=1)
+        self.batch_norm = nn.BatchNorm2d(int(c_in / 2))
+        self.conv2d = nn.Conv2d(int(c_in / 2), int(c_in / 2), kernel_size=(1, 1),)
+        self.sigmoid = nn.Sigmoid()
+        self.out_conv = nn.Conv2d(int(c_in / 2), c_out, kernel_size=(1, 1),)
+
+    def forward(self, x):
+        x = self.glu(x)
+        x = self.batch_norm(x)
+        x = self.conv2d(x)
+        x = self.sigmoid(x)
+        x = self.out_conv(x)
+        return x
 
 
 class Model(nn.Module):
@@ -112,122 +162,144 @@ class Model(nn.Module):
         units,
         stack_cnt,
         time_step,
-        multi_layer,
-        horizon=1,
+        attention_channel,
+        is_randomwalk_laplacian,
+        kernel_size,
+        gcnn_channel,
+        gconv_channel,
+        multi_channel,
+        horizon,
         dropout_rate=0.5,
         leaky_rate=0.2,
-        device="cpu",
+        device="cuda",
     ):
         super(Model, self).__init__()
         self.unit = units  # # of nodes
         self.stack_cnt = stack_cnt  # 2
         self.alpha = leaky_rate
-        self.time_step = time_step  # window size
+        self.time_step = time_step
         self.horizon = horizon
-        self.weight_key = nn.Parameter(torch.zeros(size=(self.unit, 1)))
-        nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)
-        self.weight_query = nn.Parameter(torch.zeros(size=(self.unit, 1)))
-        nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)
-        self.GRU = nn.GRU(self.time_step, self.unit)  # input window, hidden node
-        self.multi_layer = multi_layer  # 5
-        self.stock_block = nn.ModuleList()
-        self.stock_block.extend(
+        self.attention_channel = attention_channel
+        self.kernel_size = kernel_size
+        self.gcnn_channel = gcnn_channel
+        self.gconv_channel = gconv_channel
+
+        self.GRU = nn.GRU(self.unit, self.unit, batch_first=True, num_layers=1,)
+        self.weight_key = nn.Parameter(torch.zeros(size=(1, self.attention_channel)))
+        nn.init.kaiming_uniform_(self.weight_key.data)
+        self.weight_query = nn.Parameter(torch.zeros(size=(1, self.attention_channel)))
+        nn.init.kaiming_uniform_(self.weight_query.data)
+        self.weight_attention = nn.Parameter(
+            torch.zeros(size=(self.attention_channel * self.unit, self.unit))
+        )
+        nn.init.kaiming_normal_(self.weight_attention.data)
+
+        self.multi_channel = multi_channel
+        self.is_randomwalk_laplacian = is_randomwalk_laplacian
+
+        self.stemgnn_block = nn.ModuleList()
+        self.stemgnn_block.extend(
             [
-                StockBlockLayer(self.time_step, self.unit, self.multi_layer, stack_cnt=i)
+                StemGNN_Block(
+                    self.time_step,
+                    self.unit,
+                    self.kernel_size,
+                    self.gcnn_channel,
+                    self.gconv_channel,
+                    self.multi_channel,
+                    dropout_rate,
+                    stack_cnt=i,
+                )
                 for i in range(self.stack_cnt)
             ]
         )
-        self.fc = nn.Sequential(
-            nn.Linear(int(self.time_step), int(self.time_step)),
-            nn.LeakyReLU(),
-            nn.Linear(int(self.time_step), self.horizon),
-        )
+        self.forecast_output = OutputLayer(self.multi_channel, 1)
+        self.backcast_output = OutputLayer(self.multi_channel, self.time_step)
+
+        self.relu = nn.ReLU()
         self.leakyrelu = nn.LeakyReLU(self.alpha)
         self.dropout = nn.Dropout(p=dropout_rate)
-        self.to(device)
-
-    def get_laplacian(self, graph, normalize):
-        """
-        return the laplacian of the graph.
-        :param graph: the graph structure without self loop, [N, N].
-        :param normalize: whether to used the normalized laplacian.
-        :return: graph laplacian.
-        """
-        if normalize:
-            D = torch.diag(torch.sum(graph, dim=-1) ** (-1 / 2))
-            L = torch.eye(graph.size(0), device=graph.device, dtype=graph.dtype) - torch.mm(
-                torch.mm(D, graph), D
-            )
-        else:
-            D = torch.diag(torch.sum(graph, dim=-1))
-            L = D - graph
-        return L
-
-    def cheb_polynomial(self, laplacian):
-        """
-        Compute the Chebyshev Polynomial, according to the graph laplacian.
-        :param laplacian: the graph laplacian, [N, N].
-        :return: the multi order Chebyshev laplacian, [K, N, N].
-        """
-        N = laplacian.size(0)  # [N, N]
-        laplacian = laplacian.unsqueeze(0)
-        first_laplacian = torch.zeros([1, N, N], device=laplacian.device, dtype=torch.float)
-        second_laplacian = laplacian
-        third_laplacian = (2 * torch.matmul(laplacian, second_laplacian)) - first_laplacian
-        forth_laplacian = 2 * torch.matmul(laplacian, third_laplacian) - second_laplacian
-        multi_order_laplacian = torch.cat(
-            [first_laplacian, second_laplacian, third_laplacian, forth_laplacian], dim=0
-        )
-        return multi_order_laplacian
+        self.device = device
+        self.to(self.device)
 
     def latent_correlation_layer(self, x):
-        input, _ = self.GRU(
-            x.permute(2, 0, 1).contiguous()
-        )  # node(sequence length), batch, node(hidden)
-        input = input.permute(
-            1, 0, 2
-        ).contiguous()  # batch, node(sequence length), node(hidden)
-        attention = self.self_graph_attention(input)
+        batch_size = x.shape[0]
+        output, hidden = self.GRU(x)
+        output = output[:, -1:, :]
+        attention = self.self_graph_attention(output)
         attention = torch.mean(attention, dim=0)  # average of batch
         degree = torch.sum(attention, dim=1)
         # laplacian is sym or not
         attention = 0.5 * (attention + attention.T)
-        degree_l = torch.diag(degree)
-        diagonal_degree_hat = torch.diag(1 / (torch.sqrt(degree) + 1e-7))
-        laplacian = torch.matmul(
-            diagonal_degree_hat, torch.matmul(degree_l - attention, diagonal_degree_hat)
-        )
-        mul_L = self.cheb_polynomial(laplacian)
-        return mul_L, attention
+        if self.is_randomwalk_laplacian:
+            laplacian = calculate_randomwalk_normalized_laplacian(attention)
+        else:
+            laplacian = calculate_normalized_laplacian(attention).to(self.device)
+        Lambda_, U = torch.symeig(laplacian, eigenvectors=True)
+        # Lambda_ = self.relu(Lambda_)
+        # U = self.relu(U)
+        return Lambda_, U, attention
 
     def self_graph_attention(self, input):
-        input = input.permute(
-            0, 2, 1
-        ).contiguous()  # batch, node(hidden), node(sequence length, feature)
-        bat, N, fea = input.size()
-        key = torch.matmul(input, self.weight_key)  # batch, node(hidden), 1
-        query = torch.matmul(input, self.weight_query)
-        data = key.repeat(1, 1, N).view(bat, N * N, 1) + query.repeat(1, N, 1)
+        batch_size = input.shape[0]
+        input = input.permute(0, 2, 1).contiguous()
+        key = torch.einsum("bni, io -> bno", input, self.weight_key)
+        query = torch.einsum("bni, io -> bno", input, self.weight_query)
+        data = key.repeat(1, 1, self.unit).view(
+            batch_size, self.unit * self.unit, -1
+        ) + query.repeat(1, self.unit, 1)
         data = data.squeeze(2)
-        data = data.view(bat, N, -1)
+        data = data.view(batch_size, self.unit, -1)
+        data = torch.matmul(data, self.weight_attention)
         data = self.leakyrelu(data)
         attention = F.softmax(data, dim=2)
         attention = self.dropout(attention)
         return attention
 
-    def graph_fft(self, input, eigenvectors):
-        return torch.matmul(eigenvectors, input)
-
     def forward(self, x):
-        mul_L, attention = self.latent_correlation_layer(x)
-        X = x.unsqueeze(1).permute(0, 1, 3, 2).contiguous()  # torch.Size([32, 1, 228, 12])
-        result = []
+        Lambda_, U, attention = self.latent_correlation_layer(x)
+        x = x.permute(0, 2, 1).contiguous()
+        X = x.unsqueeze(1).contiguous()  # batch, feature, node, window
+        result_forecast = []
+        result_backcast = []
         for stack_i in range(self.stack_cnt):
-            forecast, X = self.stock_block[stack_i](X, mul_L)
-            result.append(forecast)
-        forecast = result[0] + result[1]
-        forecast = self.fc(forecast)
-        if forecast.size()[-1] == 1:
-            return forecast.unsqueeze(1).squeeze(-1), attention
+            forecast, backcast, X = self.stemgnn_block[stack_i](X, Lambda_, U)
+            result_forecast.append(forecast)
+            result_backcast.append(backcast)
+        # print("result_forecast shape 0: ", result_forecast[0].shape)
+        # print("result_forecast shape 1: ", result_forecast[1].shape)
+        forecast = (
+            result_forecast[0][:, :, :, (3 - 1) * 2 : result_forecast[0].shape[3]]
+            + result_forecast[1]
+        )
+        if len(result_backcast) > 1:
+            backcast = (
+                result_backcast[0][:, :, :, (3 - 1) * 2 : result_backcast[0].shape[3]]
+                + result_backcast[1]
+            )
+
         else:
-            return forecast.permute(0, 2, 1).contiguous(), attention
+            backcast = result_backcast[0][
+                :, :, :, (3 - 1) * 2 : result_backcast[0].shape[3]
+            ]
+
+        forecast = self.forecast_output(forecast)[
+            :, :, :, forecast.shape[3] - 1 : forecast.shape[3]
+        ]
+        forecast = forecast.squeeze(3)
+        # forecast = self.forecast_output(forecast)
+        # forecast = torch.mean(forecast, dim=3)
+
+        backcast = self.backcast_output(backcast)[
+            :, :, :, backcast.shape[3] - 1 : backcast.shape[3]
+        ]
+        backcast = backcast.squeeze(3)
+        # backcast = self.backcast_output(backcast)
+        # backcast = torch.mean(backcast, dim=3)
+
+        if forecast.size()[-1] == 1:
+            return forecast.unsqueeze(1).squeeze(-1), backcast, attention
+            # return forecast.unsqueeze(1).squeeze(-1), attention
+        else:
+            return forecast, backcast, attention
+            # return forecast, attention

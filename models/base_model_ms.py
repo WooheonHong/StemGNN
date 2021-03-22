@@ -1,3 +1,8 @@
+from utils.graph_utils import calculate_normalized_laplacian
+from utils.graph_utils import calculate_randomwalk_normalized_laplacian
+from utils.graph_utils import cheb_polynomial
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,10 +19,11 @@ class GLU(nn.Module):
 
 
 class StockBlockLayer(nn.Module):
-    def __init__(self, time_step, unit, multi_layer, stack_cnt=0):
+    def __init__(self, time_step, unit, multi_layer, dropout_rate, stack_cnt=0):
         super(StockBlockLayer, self).__init__()
         self.time_step = time_step
         self.unit = unit
+        self.dropout = nn.Dropout(p=dropout_rate)
         self.stack_cnt = stack_cnt
         self.multi = multi_layer
         self.weight = nn.Parameter(
@@ -25,12 +31,14 @@ class StockBlockLayer(nn.Module):
                 1, 3 + 1, 1, self.time_step * self.multi, self.multi * self.time_step
             )
         )  # [K+1, 1, in_c, out_c]
-        nn.init.xavier_normal_(self.weight)
+        # nn.init.xavier_normal_(self.weight)
+        nn.init.kaiming_normal_(self.weight)
         self.forecast = nn.Linear(self.time_step * self.multi, self.time_step * self.multi)
         self.forecast_result = nn.Linear(self.time_step * self.multi, self.time_step)
         if self.stack_cnt == 0:
             self.backcast = nn.Linear(self.time_step * self.multi, self.time_step)
         self.backcast_short_cut = nn.Linear(self.time_step, self.time_step)
+        self.batch_norm_forecast = nn.BatchNorm1d(self.unit)
         self.relu = nn.ReLU()
         self.GLUs = nn.ModuleList()
         self.output_channel = 4 * self.multi
@@ -95,11 +103,15 @@ class StockBlockLayer(nn.Module):
         gconv_input = self.spe_seq_cell(gfted).unsqueeze(2)  # batch 4, 1, node, window
         igfted = torch.matmul(gconv_input, self.weight)  # batch 4, 1, node, window *
         igfted = torch.sum(igfted, dim=1)
-        forecast_source = torch.sigmoid(self.forecast(igfted).squeeze(1))
+        # forecast_source = torch.sigmoid(self.forecast(igfted).squeeze(1))
+        forecast_source = self.relu(self.forecast(igfted).squeeze(1))
+        # forecast_source = self.batch_norm_forecast(forecast_source)
         forecast = self.forecast_result(forecast_source)
+        # forecast = self.batch_norm_forecast(forecast)
         if self.stack_cnt == 0:
             backcast_short = self.backcast_short_cut(x).squeeze(1)
-            backcast_source = torch.sigmoid(self.backcast(igfted) - backcast_short)
+            # backcast_source = torch.sigmoid(self.backcast(igfted) - backcast_short)
+            backcast_source = self.relu(self.backcast(igfted) - backcast_short)
         else:
             backcast_source = None
 
@@ -113,10 +125,12 @@ class Model(nn.Module):
         stack_cnt,
         time_step,
         multi_layer,
+        is_randomwalk_laplacian,
+        attention_layer,
         horizon=1,
         dropout_rate=0.5,
         leaky_rate=0.2,
-        device="cpu",
+        device="cuda",
     ):
         super(Model, self).__init__()
         self.unit = units  # # of nodes
@@ -124,16 +138,30 @@ class Model(nn.Module):
         self.alpha = leaky_rate
         self.time_step = time_step  # window size
         self.horizon = horizon
-        self.weight_key = nn.Parameter(torch.zeros(size=(self.unit, 1)))
-        nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)
-        self.weight_query = nn.Parameter(torch.zeros(size=(self.unit, 1)))
-        nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)
+        self.attention_layer = attention_layer
+        self.weight_key = nn.Parameter(torch.zeros(size=(self.unit, self.attention_layer)))
+        # nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)
+        nn.init.kaiming_uniform_(self.weight_key.data)
+        self.weight_query = nn.Parameter(
+            torch.zeros(size=(self.unit, self.attention_layer))
+        )
+        # nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)
+        nn.init.kaiming_uniform_(self.weight_query.data)
+        self.weight_attention = nn.Parameter(
+            torch.zeros(size=(self.unit * self.attention_layer, self.unit))
+        )
+        # nn.init.xavier_normal_(self.weight_attention.data, gain=1.414)
+        nn.init.kaiming_normal_(self.weight_attention.data)
+        self.is_randomwalk_laplacian = is_randomwalk_laplacian
         self.GRU = nn.GRU(self.time_step, self.unit)  # input window, hidden node
+        self.cheb_k = 4
         self.multi_layer = multi_layer  # 5
         self.stock_block = nn.ModuleList()
         self.stock_block.extend(
             [
-                StockBlockLayer(self.time_step, self.unit, self.multi_layer, stack_cnt=i)
+                StockBlockLayer(
+                    self.time_step, self.unit, self.multi_layer, dropout_rate, stack_cnt=i
+                )
                 for i in range(self.stack_cnt)
             ]
         )
@@ -144,7 +172,7 @@ class Model(nn.Module):
         )
         self.leakyrelu = nn.LeakyReLU(self.alpha)
         self.dropout = nn.Dropout(p=dropout_rate)
-        self.to(device)
+        self.device = device
 
     def get_laplacian(self, graph, normalize):
         """
@@ -163,41 +191,19 @@ class Model(nn.Module):
             L = D - graph
         return L
 
-    def cheb_polynomial(self, laplacian):
-        """
-        Compute the Chebyshev Polynomial, according to the graph laplacian.
-        :param laplacian: the graph laplacian, [N, N].
-        :return: the multi order Chebyshev laplacian, [K, N, N].
-        """
-        N = laplacian.size(0)  # [N, N]
-        laplacian = laplacian.unsqueeze(0)
-        first_laplacian = torch.zeros([1, N, N], device=laplacian.device, dtype=torch.float)
-        second_laplacian = laplacian
-        third_laplacian = (2 * torch.matmul(laplacian, second_laplacian)) - first_laplacian
-        forth_laplacian = 2 * torch.matmul(laplacian, third_laplacian) - second_laplacian
-        multi_order_laplacian = torch.cat(
-            [first_laplacian, second_laplacian, third_laplacian, forth_laplacian], dim=0
-        )
-        return multi_order_laplacian
-
     def latent_correlation_layer(self, x):
-        input, _ = self.GRU(
-            x.permute(2, 0, 1).contiguous()
-        )  # node(sequence length), batch, node(hidden)
-        input = input.permute(
-            1, 0, 2
-        ).contiguous()  # batch, node(sequence length), node(hidden)
+        input, _ = self.GRU(x.permute(2, 0, 1).contiguous())
+        input = input.permute(1, 0, 2).contiguous()
         attention = self.self_graph_attention(input)
-        attention = torch.mean(attention, dim=0)  # average of batch
+        attention = torch.mean(attention, dim=0)
         degree = torch.sum(attention, dim=1)
         # laplacian is sym or not
         attention = 0.5 * (attention + attention.T)
-        degree_l = torch.diag(degree)
-        diagonal_degree_hat = torch.diag(1 / (torch.sqrt(degree) + 1e-7))
-        laplacian = torch.matmul(
-            diagonal_degree_hat, torch.matmul(degree_l - attention, diagonal_degree_hat)
-        )
-        mul_L = self.cheb_polynomial(laplacian)
+        laplacian = calculate_normalized_laplacian(attention)
+        # laplacian = calculate_randomwalk_normalized_laplacian(attention)
+
+        mul_L = cheb_polynomial(laplacian, self.cheb_k).to(self.device)
+
         return mul_L, attention
 
     def self_graph_attention(self, input):
@@ -207,16 +213,15 @@ class Model(nn.Module):
         bat, N, fea = input.size()
         key = torch.matmul(input, self.weight_key)  # batch, node(hidden), 1
         query = torch.matmul(input, self.weight_query)
-        data = key.repeat(1, 1, N).view(bat, N * N, 1) + query.repeat(1, N, 1)
+        data = key.repeat(1, 1, N).view(bat, N * N, -1) + query.repeat(1, N, 1)
         data = data.squeeze(2)
         data = data.view(bat, N, -1)
+        data = torch.matmul(data, self.weight_attention)
         data = self.leakyrelu(data)
         attention = F.softmax(data, dim=2)
         attention = self.dropout(attention)
-        return attention
 
-    def graph_fft(self, input, eigenvectors):
-        return torch.matmul(eigenvectors, input)
+        return attention
 
     def forward(self, x):
         mul_L, attention = self.latent_correlation_layer(x)
