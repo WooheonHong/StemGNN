@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 
 from data_loader.forecast_dataloader import ForecastDataset, de_normalized
-from models.base_model import Model
+from models.model import Model
 import torch
 import torch.nn as nn
 import torch.utils.data as torch_data
@@ -56,7 +56,6 @@ def inference(
             forecast_steps = np.zeros([inputs.size()[0], horizon, node_cnt], dtype=np.float)
             while step < horizon:
                 forecast_result, backcast_result, a = model(inputs)
-                # forecast_result, a = model(inputs)
                 len_model_output = forecast_result.size()[1]
                 if len_model_output == 0:
                     raise Exception("Get blank inference result")
@@ -207,8 +206,8 @@ def train(train_data, valid_data, args, result_file):
         valid_set, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
 
-    forecast_loss = nn.MSELoss(reduction="mean").to(args.device)
-    backcast_loss = nn.MSELoss(reduction="mean").to(args.device)
+    forecast_loss = nn.MSELoss(reduction="sum").to(args.device)
+    backcast_loss = nn.MSELoss(reduction="sum").to(args.device)
 
     total_params = 0
     for name, parameter in model.named_parameters():
@@ -231,7 +230,6 @@ def train(train_data, valid_data, args, result_file):
             target = target.to(args.device)
             model.zero_grad()
             forecast, backcast, attention = model(inputs)
-            # forecast, attention = model(inputs)
             # print("forecast shape", forecast.shape)
             # print("backcast shape", backcast.shape)
             # print("target shape", target[:, 0:1, :].shape)
@@ -239,7 +237,6 @@ def train(train_data, valid_data, args, result_file):
             loss = forecast_loss(forecast, target[:, 0:1, :]) + backcast_loss(
                 backcast, inputs
             )
-            # loss = forecast_loss(forecast, target[:, 0:1, :])
             cnt += 1
             loss.backward()
             my_optim.step()
@@ -408,7 +405,7 @@ def tuning(train_data, valid_data, test_data, args, params):
             valid_set, batch_size=args.batch_size, shuffle=False, num_workers=0
         )
 
-        forecast_loss = nn.MSELoss(reduction="mean").to(args.device)
+        forecast_loss = nn.MSELoss(reduction="sum").to(args.device)
         performance_metrics = {}
         manager.begin_run(run, model, train_loader, valid_loader)
         for epoch in range(args.epoch):

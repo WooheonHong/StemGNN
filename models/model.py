@@ -63,6 +63,15 @@ class StemGNN_Block(nn.Module):
         self.residual_conv.append(
             nn.Conv2d(self.gconv_channel, self.residual_channel, kernel_size=(1, 1))
         )
+        self.residual_kernel_conv = nn.Sequential(
+            nn.Conv2d(
+                self.gconv_channel, self.gconv_channel, kernel_size=(1, self.kernel_size)
+            ),
+            nn.Sigmoid(),
+            nn.Conv2d(self.gconv_channel, self.residual_channel, kernel_size=(1, 1)),
+            nn.Softmax(dim=1),
+        )
+
         self.gcnn_real.append(GCNN(self.gconv_channel, self.gcnn_channel, self.kernel_size))
         self.gcnn_imag.append(GCNN(self.gconv_channel, self.gcnn_channel, self.kernel_size))
 
@@ -77,13 +86,17 @@ class StemGNN_Block(nn.Module):
             # nn.Softmax(dim=1),
         )
         self.forecast = nn.Sequential(
-            nn.Conv2d(self.gconv_channel, self.multi_channel, kernel_size=(1, 1),),
+            nn.Conv2d(
+                self.gconv_channel, self.multi_channel, kernel_size=(1, self.kernel_size),
+            ),
             nn.ReLU(),
             nn.BatchNorm2d(self.multi_channel),
             nn.Dropout(p=dropout_rate),
         )
         self.backcast = nn.Sequential(
-            nn.Conv2d(self.gconv_channel, self.multi_channel, kernel_size=(1, 1),),
+            nn.Conv2d(
+                self.gconv_channel, self.multi_channel, kernel_size=(1, self.kernel_size),
+            ),
             nn.ReLU(),
             nn.BatchNorm2d(self.multi_channel),
             nn.Dropout(p=dropout_rate),
@@ -91,7 +104,8 @@ class StemGNN_Block(nn.Module):
 
     def spe_seq_cell(self, x):
         # for real input, negative frequency redundant
-        ffted = torch.fft.rfft(x)  # 12 -> (12/6) + 1
+        ffted = torch.fft.fft(x)  # 12 ->
+        # ffted = torch.fft.rfft(x)  # 12 -> (12/6) + 1
         # ffted = torch.stft(x, 4)  # 12 -> (12/6) + 1
         # print("after fft:", ffted.shape)
         real = self.gcnn_real[self.stack_cnt](ffted.real)  # (12/6) + 1 -> (12/6) + 1 - 2
@@ -99,7 +113,8 @@ class StemGNN_Block(nn.Module):
         time_step_as_inner = torch.stack((real, imag), -1)
         # print("time_step_as_inner: ", time_step_as_inner.shape)
         time_step_as_inner = torch.view_as_complex(time_step_as_inner)
-        iffted = torch.fft.irfft(time_step_as_inner)  # (((12/6) + 1 - 2 ) - 1) * 2-> 8
+        iffted = torch.fft.ifft(time_step_as_inner).real
+        # iffted = torch.fft.irfft(time_step_as_inner)  # (((12/6) + 1 - 2 ) - 1) * 2-> 8
         # iffted = torch.istft(time_step_as_inner, 4)
         # print("iffted shape: ", iffted.shape)
 
@@ -109,8 +124,17 @@ class StemGNN_Block(nn.Module):
         GFT = torch.transpose(U, 0, 1)
         gconv_operator = torch.diag_embed(Lambda_)  # make diagonal matrix
         IGFT = U
-
         x_residual = self.relu(self.residual_conv[self.stack_cnt](input))
+        if self.stack_cnt == 1:
+            x_residual_kernel = self.residual_kernel_conv(input)
+            # x = self.residual_kernel_conv(backcast)
+        # if self.stack_cnt == 0:
+        # back_forecast = x_input
+        # else:
+        # if self.stack_cnt ==1 :
+        #     x_residual_second = self.residual_kernel_conv
+
+        # else:
         # print("x residual shape: ", x_residual.shape)
         x = torch.einsum("binw, nn -> binw", input, GFT)
         x = self.spe_seq_cell(x)
@@ -118,24 +142,41 @@ class StemGNN_Block(nn.Module):
         x = torch.einsum("binw, io -> bonw", x, self.weight)
         x = torch.einsum("bonw, nn -> bonw", x, IGFT)
 
-        x = self.fc(x)
-
-        x = self.relu(
-            x_residual[:, :, :, (self.kernel_size - 1) * 2 : x_residual.shape[3]] + x
-        )
+        backcast_source = self.fc(x)
+        x = backcast_source
+        x = self.relu(x + x_residual[:, :, :, (self.kernel_size - 1) : x_residual.shape[3]])
 
         if self.stack_cnt == 0:
-            backcast_source = x_residual[
-                :, :, :, (self.kernel_size - 1) * 2 : x_residual.shape[3]
-            ] - self.relu(x)
+            x = self.relu(
+                x
+                + x_residual[
+                    :,
+                    :,
+                    :,
+                    (self.kernel_size - 1) * (1 + self.stack_cnt) : x_residual.shape[3],
+                ]
+            )
+            backcast_input = (
+                x_residual[
+                    :,
+                    :,
+                    :,
+                    (self.kernel_size - 1) * (1 + self.stack_cnt) : x_residual.shape[3],
+                ]
+                - backcast_source
+            )
 
         else:
-            backcast_source = x
+            backcast_input = (
+                x
+                + x_residual[:, :, :, (self.kernel_size - 1) : x_residual.shape[3],]
+                + x_residual_kernel
+            )
 
         forecast = self.forecast(x)
-        backcast = self.backcast(backcast_source)
+        backcast = self.backcast(x)
 
-        return forecast, backcast, backcast_source
+        return forecast, backcast, backcast_input
 
 
 class OutputLayer(nn.Module):
@@ -236,8 +277,6 @@ class Model(nn.Module):
         else:
             laplacian = calculate_normalized_laplacian(attention).to(self.device)
         Lambda_, U = torch.symeig(laplacian, eigenvectors=True)
-        # Lambda_ = self.relu(Lambda_)
-        # U = self.relu(U)
         return Lambda_, U, attention
 
     def self_graph_attention(self, input):
@@ -269,19 +308,17 @@ class Model(nn.Module):
         # print("result_forecast shape 0: ", result_forecast[0].shape)
         # print("result_forecast shape 1: ", result_forecast[1].shape)
         forecast = (
-            result_forecast[0][:, :, :, (3 - 1) * 2 : result_forecast[0].shape[3]]
+            result_forecast[0][:, :, :, (3 - 1) : result_forecast[0].shape[3]]
             + result_forecast[1]
         )
         if len(result_backcast) > 1:
             backcast = (
-                result_backcast[0][:, :, :, (3 - 1) * 2 : result_backcast[0].shape[3]]
+                result_backcast[0][:, :, :, (3 - 1) : result_backcast[0].shape[3]]
                 + result_backcast[1]
             )
 
         else:
-            backcast = result_backcast[0][
-                :, :, :, (3 - 1) * 2 : result_backcast[0].shape[3]
-            ]
+            backcast = result_backcast[0][:, :, :, (3 - 1) : result_backcast[0].shape[3]]
 
         forecast = self.forecast_output(forecast)[
             :, :, :, forecast.shape[3] - 1 : forecast.shape[3]
@@ -299,7 +336,5 @@ class Model(nn.Module):
 
         if forecast.size()[-1] == 1:
             return forecast.unsqueeze(1).squeeze(-1), backcast, attention
-            # return forecast.unsqueeze(1).squeeze(-1), attention
         else:
             return forecast, backcast, attention
-            # return forecast, attention
