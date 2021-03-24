@@ -14,15 +14,28 @@ import numpy as np
 class GCNN(nn.Module):
     def __init__(self, input_channel, output_channel, kernel_size=3):
         super(GCNN, self).__init__()
+        self.input_channel = input_channel
+        self.output_channel = output_channel
+
+        self.kernel_size = kernel_size
         self.filter_conv = nn.Conv2d(
-            input_channel, output_channel, kernel_size=(1, kernel_size),
+            self.input_channel, self.output_channel, kernel_size=(1, kernel_size),
         )
         self.gate_conv = nn.Conv1d(
-            input_channel, output_channel, kernel_size=(1, kernel_size),
+            self.input_channel, self.output_channel, kernel_size=(1, kernel_size),
+        )
+        self.down_conv = nn.Conv2d(
+            self.input_channel, self.output_channel, kernel_size=(1, 1),
         )
 
     def forward(self, x):
-        return torch.mul(self.filter_conv(x), torch.sigmoid(self.gate_conv(x)))
+        if self.input_channel > self.output_channel:
+            x_residual = self.down_conv(x)
+        else:
+            x_residual = x
+        x_residual = x_residual[:, :, :, self.kernel_size - 1 : x.shape[3]]
+
+        return torch.mul(self.filter_conv(x) + x_residual, torch.sigmoid(self.gate_conv(x)))
 
 
 class StemGNN_Block(nn.Module):
@@ -124,7 +137,11 @@ class StemGNN_Block(nn.Module):
         GFT = torch.transpose(U, 0, 1)
         gconv_operator = torch.diag_embed(Lambda_)  # make diagonal matrix
         IGFT = U
-        x_residual = self.relu(self.residual_conv[self.stack_cnt](input))
+        x_residual = self.relu(
+            self.residual_conv[self.stack_cnt](
+                input[:, :, :, self.kernel_size - 1 : input.shape[3]]
+            )
+        )
         if self.stack_cnt == 1:
             x_residual_kernel = self.residual_kernel_conv(input)
             # x = self.residual_kernel_conv(backcast)
@@ -144,37 +161,19 @@ class StemGNN_Block(nn.Module):
 
         backcast_source = self.fc(x)
         x = backcast_source
-        x = self.relu(x + x_residual[:, :, :, (self.kernel_size - 1) : x_residual.shape[3]])
+        x = self.relu(x + x_residual)
 
         if self.stack_cnt == 0:
-            x = self.relu(
-                x
-                + x_residual[
-                    :,
-                    :,
-                    :,
-                    (self.kernel_size - 1) * (1 + self.stack_cnt) : x_residual.shape[3],
-                ]
-            )
-            backcast_input = (
-                x_residual[
-                    :,
-                    :,
-                    :,
-                    (self.kernel_size - 1) * (1 + self.stack_cnt) : x_residual.shape[3],
-                ]
-                - backcast_source
-            )
+            x = self.relu(x + x_residual)
+            backcast_input = x_residual - backcast_source
+            backcast_input = backcast_input[
+                :, :, :, self.kernel_size - 1 : backcast_input.shape[3]
+            ]
 
         else:
-            x = (
-                x
-                + x_residual[:, :, :, (self.kernel_size - 1) : x_residual.shape[3],]
-                + x_residual_kernel
-            )
+            x = x + x_residual + x_residual_kernel
             x = self.relu(x)
             backcast_input = None
-
         forecast = self.forecast(x)
         backcast = self.backcast(x)
 
@@ -182,16 +181,16 @@ class StemGNN_Block(nn.Module):
 
 
 class OutputLayer(nn.Module):
-    def __init__(self, c_in, c_out):
+    def __init__(self, c_in, c_out, kernel_size):
         super(OutputLayer, self).__init__()
-        self.glu = nn.GLU(dim=1)
-        self.batch_norm = nn.BatchNorm2d(int(c_in / 2))
-        self.conv2d = nn.Conv2d(int(c_in / 2), int(c_in / 2), kernel_size=(1, 1),)
+        self.gcnn_out = GCNN(c_in, c_in, kernel_size)
+        self.batch_norm = nn.BatchNorm2d(c_in)
+        self.conv2d = nn.Conv2d(c_in, c_in, kernel_size=(1, 1))
         self.sigmoid = nn.Sigmoid()
-        self.out_conv = nn.Conv2d(int(c_in / 2), c_out, kernel_size=(1, 1),)
+        self.out_conv = nn.Conv2d(c_in, c_out, kernel_size=(1, 1))
 
     def forward(self, x):
-        x = self.glu(x)
+        x = self.gcnn_out(x)
         x = self.batch_norm(x)
         x = self.conv2d(x)
         x = self.sigmoid(x)
@@ -256,8 +255,8 @@ class Model(nn.Module):
                 for i in range(self.stack_cnt)
             ]
         )
-        self.forecast_output = OutputLayer(self.multi_channel, 1)
-        self.backcast_output = OutputLayer(self.multi_channel, self.time_step)
+        self.forecast_output = OutputLayer(self.multi_channel, 1, 4)
+        self.backcast_output = OutputLayer(self.multi_channel, self.time_step, 4)
 
         self.relu = nn.ReLU()
         self.leakyrelu = nn.LeakyReLU(self.alpha)
@@ -310,28 +309,25 @@ class Model(nn.Module):
         # print("result_forecast shape 0: ", result_forecast[0].shape)
         # print("result_forecast shape 1: ", result_forecast[1].shape)
         forecast = (
-            result_forecast[0][:, :, :, (3 - 1) : result_forecast[0].shape[3]]
+            result_forecast[0][:, :, :, (3 - 1) * 2 : result_forecast[0].shape[3]]
             + result_forecast[1]
         )
         if len(result_backcast) > 1:
             backcast = (
-                result_backcast[0][:, :, :, (3 - 1) : result_backcast[0].shape[3]]
+                result_backcast[0][:, :, :, (3 - 1) * 2 : result_backcast[0].shape[3]]
                 + result_backcast[1]
             )
 
         else:
-            backcast = result_backcast[0][:, :, :, (3 - 1) : result_backcast[0].shape[3]]
+            backcast = result_backcast[0][
+                :, :, :, (3 - 1) * 2 : result_backcast[0].shape[3]
+            ]
 
-        forecast = self.forecast_output(forecast)[
-            :, :, :, forecast.shape[3] - 1 : forecast.shape[3]
-        ]
+        forecast = self.forecast_output(forecast)
         forecast = forecast.squeeze(3)
         # forecast = self.forecast_output(forecast)
         # forecast = torch.mean(forecast, dim=3)
-
-        backcast = self.backcast_output(backcast)[
-            :, :, :, backcast.shape[3] - 1 : backcast.shape[3]
-        ]
+        backcast = self.backcast_output(backcast)
         backcast = backcast.squeeze(3)
         # backcast = self.backcast_output(backcast)
         # backcast = torch.mean(backcast, dim=3)
