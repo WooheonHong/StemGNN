@@ -167,11 +167,13 @@ class StemGNN_Block(nn.Module):
             )
 
         else:
-            backcast_input = (
+            x = (
                 x
                 + x_residual[:, :, :, (self.kernel_size - 1) : x_residual.shape[3],]
                 + x_residual_kernel
             )
+            x = self.relu(x)
+            backcast_input = None
 
         forecast = self.forecast(x)
         backcast = self.backcast(x)

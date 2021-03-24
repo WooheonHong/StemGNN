@@ -28,8 +28,6 @@ New parameter are bold type.
 
 | Parameter name | Description of parameter |
 | --- | --- |
-| train | whether to enable training, default True |
-| evaluate | whether to enable evaluation, default True |
 | dataset | file name of input csv |
 | window_size | length of sliding window, default 12 |
 | horizon | predict horizon, default 3 |
@@ -37,13 +35,21 @@ New parameter are bold type.
 | validate_length | length of validation data, default 2 |
 | test_length | length of testing data, default 1 |
 | epoch | epoch size during training |
-| lr | learning rate |
-| **attention_layer** | hyper parameter of STemGNN which controls the parameter number of attention layers, default 32|
-| **randomwalk_laplacian** | determine whether to use randomwalk normalized laplacian matrix|
-| multi_layer | hyper parameter of STemGNN which controls the parameter number of hidden layers, default 5 |
+| optimizer | optimizer, default RMSProp |
+| lr | learning rate, default 1e-3 |
+| decay_rate | decay rate, default 0.7 |
+| exponential_decay_step | exponential decay step, default 5 |
+| randomwalk_laplacian | determine whether to use randomwalk normalized laplacian matrix|
+| attention_channel | hyper parameter of latent correlation layer, default 32|
+| kernel_size | hyper parameter of Gated CNN's kernel size, default 3|
+| gcnn_channel | hyper parameter of Gated CNN's channel, default 32|
+| gconv_channel | hyper parameter of Graph Convolution channel, default 64|
+| multi_channel | hyper parameter of StemBlock's forecast, backcast output channel, default 128 
 | device | device that the code works on, 'cpu' or 'cuda:x' | 
 | validate_freq | frequency of validation |
 | batch_size | batch size, default 64 |
+| dropout_rate | dropout_rate, default 0.2 |
+| leakyrelu_rate | leakyrelu rate, default 0.5 |
 | norm_method | method for normalization, 'z_score' or 'min_max' |
 | early_stop | whether to enable early stop, default False |
 

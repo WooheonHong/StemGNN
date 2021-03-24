@@ -22,11 +22,13 @@ x.shape
 # %%
 import torch
 
-x = torch.rand(2, 2)
+x = torch.arange(4)
+print(x)
 ffted = torch.fft.fft(x)
 real = ffted.real
 imag = ffted.imag
 print(ffted.real)
+print(ffted.imag)
 time_step_as_inner = torch.stack((real, imag), -1)
 print("time_step_as_inner: ", time_step_as_inner.shape)
 time_step_as_inner = torch.view_as_complex(time_step_as_inner)
@@ -34,3 +36,4 @@ iffted = torch.fft.ifft(time_step_as_inner)
 # iffted = torch.fft.irfft(time_step_as_inner)  # (((12/6) + 1 - 2 ) - 1) * 2-> 8
 # iffted = torch.istft(time_step_as_inner, 4)
 print("iffted shape: ", iffted.shape)
+print(iffted.real)
