@@ -1,6 +1,6 @@
 # Spectral Temporal Graph Neural Network for Multivariate Time-series Forecasting
 
-This repository is the wooheon's reproducing of StemGNN
+This repository is the wooheon's reproducing of [StemGNN](https://arxiv.org/abs/2103.07719)
 
 
 
